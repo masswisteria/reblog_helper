@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; utf-8">
+    <title>Reblog Helper</title>
+    <script src="https://sdk.amazonaws.com/js/aws-sdk-2.2.4.min.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/2.1.4/jquery.min.js"></script>
+    <script src="js/core.js"></script>
+    <script src="js/aws/lambda.js"></script>
+    <style type="text/css">
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        padding: 0;
+        overflow: hidden;
+        background-color: rgb(124, 0, 168);
+      }
+
+      header {
+        height: 50px;
+        color: #aaaaaa;
+      }
+
+      #postsFrame {
+        position: absolute;
+        top: 50px;
+        left: 0;
+        width: 100%;
+        height: 95%;
+        border: none;
+        margin: 0;
+        padding: 0;
+      }
+
+      #tumblrUserList {
+        float: left;
+        margin: 0;
+        padding: 0;
+        list-style-type: none;
+        font-size: 20px;
+      }
+
+      .tumblr-name {
+        float: left;
+        margin-right: 30px;
+        line-height: 50px;
+      }
+
+      .blog-list {
+        float: left;
+        margin-right: 10px;
+        width: 250px;
+        padding: 0;
+      }
+
+      .blog-list > li {
+        display: none;
+      }
+
+      .blog-list:hover > li,
+      .blog-list > li.active {
+        display: block;
+      }
+
+      .blog-name,
+      .blog-title {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .blog-title {
+        font-size: 70%;
+      }
+
+      .page-actions {
+        float: left;
+        margin: 0;
+        padding: 0;
+        list-style-type: none;
+      }
+
+      .page-actions > li {
+        float: left;
+        margin-right: 5px;
+      }
+
+      .lwa-controls {
+        float: right;
+        display: none;
+      }
+
+      .lwa-loaded .lwa-controls {
+        display: block;
+      }
+
+      .authenticated #LoginWithAmazon,
+      #btnRefreshCreds,
+      #btnLogout {
+        display: none;
+      }
+
+      .authenticated #btnRefreshCreds,
+      .authenticated #btnLogout {
+         display: inline;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <ul id="tumblrUserList">
+      </ul>
+      <ul class="page-actions">
+        <li>
+          <button id="btnAddTumblr" type="button">Add Tumblr Account</button>
+        </li>
+        <li>
+          <button id="btnRefreshPosts" type="button">Refresh Posts</button>
+        </li>
+      </ul>
+      <div class="lwa-controls">
+        <a href="#" id="LoginWithAmazon"><img border="0" alt="Login with Amazon" src="https://images-na.ssl-images-amazon.com/images/G/01/lwa/btnLWA_gold_156x32.png" width="156" height="32" /></a>
+        <button id="btnRefreshCreds" type="button">Refresh Creds</button>
+        <button id="btnLogout" type="button">Logout</button>
+      </div>
+    </header>
+    <iframe id="postsFrame"></iframe>
+    <div id="amazon-root"></div>
+    <script>
+      'use strict';
+      (function (RH) {
+        AWS.config.region = 'us-east-1';
+
+        var authenticateLambda = new RH.aws.Lambda('Authenticate');
+        var tumblrLambda = new RH.aws.Lambda('Tumblr');
+        var sessionId;
+        var user;
+        var tumblrUsers = [];
+        var activeTumblrUser = null;
+        var activeTumblrBlog = null;
+        var isInitialized = false;
+
+        function initializeCredentials() {
+        }
+
+        function authenticate(grant) {
+          console.log('Authenticating using grant: ' + JSON.stringify(grant));
+          AWS.config.credentials = null;
+          AWS.config.update({
+            credentials: new AWS.CognitoIdentityCredentials({
+              IdentityPoolId: 'us-east-1:4feb4761-7b41-42ef-99b6-0fa3ed66cbe5'
+            })
+          });
+          RH.aws.Lambda.setCredentials(AWS.config.credentials);
+          var invocation = authenticateLambda.invoke(grant, function (err, data) {
+            if (err) {
+              console.log(err);
+              setTimeout(function () {
+                if (invocation.callCount < 5) {
+                  invocation.execute();
+                }
+              }, 0);
+            } else {
+              console.log('Response from Authenticate:', data);
+              sessionId = data.sessionId;
+              console.log('Session ID: ' + sessionId);
+              window.localStorage.setItem('sessionId', sessionId);
+              user = data.user;
+
+              AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+                IdentityPoolId: 'us-east-1:4feb4761-7b41-42ef-99b6-0fa3ed66cbe5',
+                Logins: { 'www.amazon.com': data.accessToken }
+              });
+              RH.aws.Lambda.setCredentials(AWS.config.credentials);
+
+              $('body').toggleClass('authenticated', true);
+
+              console.log('Tumblr users: ' + JSON.stringify(user.tumblrUsers));
+              if (user.tumblrUsers.length == 0) {
+                addTumblrAccount();
+              } else {
+                getTumblrUserInfo();
+              }
+            }
+          });
+        }
+
+        function getTumblrUserInfo() {
+          for (var i = 0; i < user.tumblrUsers.length; i++) {
+            var name = user.tumblrUsers[i];
+            tumblrLambda.invoke({
+              action: 'get_user_info',
+              sessionId: sessionId,
+              userName: name
+            }, function (err, response) {
+              if (err) {
+                console.log('Error geting user info for "' + name + '": ' + err);
+              } else {
+                console.log('User info for "' + name + '": ', response);
+                tumblrUsers = [];
+                $('<ul class="blog-list"></ul>').empty();
+                tumblrUsers.push(response);
+                renderTumblrUser(response);
+                activeTumblrUser = tumblrUsers[0];
+                activeTumblrBlog = 'rainbow-rumpus-femslash-blog';
+                $('li[data-blog-name=' + activeTumblrBlog + ']').toggleClass('active', true);
+                $('#btnRefreshPosts').on('click', loadPosts);
+                if (isInitialized) {
+                  updatePostCredentials();
+                } else {
+                  loadPosts();
+                }
+              }
+            });
+          }
+        }
+
+        function renderTumblrUser(tumblrUser) {
+          console.log('Rendering tumblr user: ', tumblrUser);
+          var blogList = $('<ul class="blog-list"></ul>');
+          tumblrUser.blogs.forEach(function (blog) {
+            var blogItem = $('<li></li>')
+              .attr('data-blog-name', blog.name)
+              .append($('<span class="blog-name"></span>').text(blog.name))
+              .append($('<span class="blog-title"></span>').text(blog.title))
+              .attr('title', blog.description);
+            blogList.append(blogItem);
+          });
+
+
+          $('#tumblrUserList')
+            .append($('<li></li>')
+              .append($('<span class="tumblr-name"></span>').text(tumblrUser.name))
+              .append(blogList)
+            );
+        }
+
+        function addTumblrAccount(ev) {
+          ev && ev.preventDefault();
+          tumblrLambda.invoke({
+            action: 'request_token',
+            sessionId: sessionId
+          }, function (err, response) {
+            if (err) {
+              console.log(err);
+            } else {
+              console.log('Tumblr request token response: ', response);
+              var w = window.open('https://www.tumblr.com/oauth/authorize?oauth_token=' + response.oauthToken, 'reblogHelper_addTumblrAccount', 'centerscreen,width=500,height=500,dialog');
+              monitorForAuthorization(w, response.oauthToken);
+            }
+          });
+        }
+
+        function monitorForAuthorization(w, token) {
+          var storageKey = 'authorizationResponse_' + token;
+          setTimeout(function () {
+            var verifier = localStorage.getItem(storageKey);
+            if (verifier != null) {
+              localStorage.removeItem(storageKey);
+              processAuthorizationResponse(token, verifier);
+            } else if (!w.closed) {
+              monitorForAuthorization(w, token);
+            } else {
+              alert('Authorization denied by user.');
+            }
+          }, 100);
+        }
+
+        function processAuthorizationResponse(token, verifier) {
+          tumblrLambda.invoke({
+            action: 'link_account', sessionId: sessionId, token: token, verifier: verifier
+          }, function (err, response) {
+            if (err) {
+              console.log(err);
+            } else {
+              console.log('Tumblr link account response: ', response);
+              console.log(response);
+              tumblrUsers = [ response ];
+              activeTumblrUser = tumblrUsers[0];
+            }
+          });
+        }
+
+        function onAuthorized(response) {
+          console.log('Authorization succeeded through LWA');
+          console.log(response);
+          authenticate({ code: response.code });
+        }
+
+        function loadPosts() {
+          console.log('Refreshing posts.');
+          $('#postsFrame').attr('src', 'posts.html');
+        }
+
+        function updatePostCredentials() {
+          isInitialized = true;
+          console.log('Calling initialize()');
+          $('#postsFrame').get(0).contentWindow.initialize({
+            credentials: AWS.config.credentials,
+            sessionId: sessionId,
+            tumblrUsers: tumblrUsers,
+            activeTumblrUser: activeTumblrUser,
+            activeTumblrBlog: activeTumblrBlog
+          });
+        }
+
+        function doLwaAuthorization(ev) {
+          ev.preventDefault();
+          amazon.Login.authorize({response_type: 'code', scope: 'profile'},
+            function (response) {
+              if (response.error_condition) {
+                alert('Authentication failed.');
+                console.log('LWA authorize request failed: ' + response.error_condition);
+              } else {
+                onAuthorized(response);
+              }
+            }
+          );
+        }
+
+        window.onAmazonLoginReady = function() {
+          amazon.Login.setClientId('amzn1.application-oa2-client.c9602ff065cb46d6ac0f2fec71641330');
+          $('body').toggleClass('lwa-loaded', true);
+        };
+
+        (function(d) {
+          var a = d.createElement('script'); a.type = 'text/javascript';
+          a.async = true; a.id = 'amazon-login-sdk';
+          a.src = 'https://api-cdn.amazon.com/sdk/login1.js';
+          d.getElementById('amazon-root').appendChild(a);
+        })(document);
+
+        (function ($) {
+          $('#LoginWithAmazon').on('click', doLwaAuthorization);
+          $('#btnRefreshCreds').on('click', doLwaAuthorization);
+
+          $('#btnLogout').on('click', function () {
+            ev.preventDefault();
+            amazon.Login.logout();
+            window.localStorage.removeItem('sessionId');
+            $('body').removeClass('authenticated');
+          });
+
+          $('#btnAddTumblr').on('click', addTumblrAccount);
+
+          $('#postsFrame').on('load', updatePostCredentials);
+
+          var sessionId = window.localStorage.getItem('sessionId');
+          if (sessionId) {
+            console.log('Authenticating for session ID "' + sessionId + '"');
+            authenticate({ sessionId: sessionId });
+          }
+        })(jQuery);
+      })(window.ReblogHelper);
+    </script>
+  </body>
+</html>

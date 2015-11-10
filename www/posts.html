@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; utf-8">
+    <title>Reblog Helper</title>
+    <script src="https://sdk.amazonaws.com/js/aws-sdk-2.2.4.min.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/2.1.4/jquery.min.js"></script>
+    <script src="js/core.js"></script>
+    <script src="js/util/observable.js"></script>
+    <script src="js/util/map.js"></script>
+    <script src="js/util/set.js"></script>
+    <script src="js/data/indexedDbAccessor.js"></script>
+    <script src="js/aws/lambda.js"></script>
+    <script src="js/tag/tagClass.js"></script>
+    <script src="js/tag/tag.js"></script>
+    <script src="js/tag/tagSet.js"></script>
+    <script src="js/tag/autoTagger.js"></script>
+    <script src="js/post/post.js"></script>
+    <script src="js/post/postSet.js"></script>
+    <script src="js/ui/postSetSelector.js"></script>
+    <style type="text/css">
+      body {
+        margin: 0;
+        font-family: verdana;
+      }
+
+      #posts {
+        float: left;
+        margin: 0 50px;
+        padding: 0;
+        width: 540px;
+        list-style-type: none;
+      }
+
+      #posts > li {
+        margin-bottom: 20px;
+        border-radius: 5px;
+        padding: 5px 0;
+        background-color: #ffffff;
+      }
+
+      .loading-post .post {
+        visibility: hidden;
+      }
+
+      .loading-post #posts {
+        background-color: #000088;
+      }
+
+      .in-progress {
+        cursor: wait !important;
+      }
+
+      .in-progress .post {
+        opacity: 0.85;
+      }
+
+      .post-content {
+        margin: 5px;
+        overflow: hidden;
+      }
+
+      .post-footer {
+        position: relative;
+        min-height: 40px;
+        padding: 5px;
+        padding-right: 65px;
+        overflow: hidden;
+      }
+
+      .post.open .post-footer {
+        overflow: visible;
+      }
+
+      .post-tags {
+        font-family: courier, monospace;
+        font-size: 85%;
+      }
+
+      .post-content-photo,
+      .post-content-audio,
+      .post-content-video {
+        margin: 5px 0;
+      }
+
+      .post-content-photo > .post-caption,
+      .post-content-audio > .post-caption,
+      .post-content-video > .post-caption {
+        margin: 0 5px;
+      }
+
+      #focusSink {
+        position: fixed;
+        top: 0;
+        left: 640px;
+      }
+
+      .queue-action {
+        position: fixed;
+        top: 0;
+        left: 640px;
+        border-radius: 5px;
+        padding: 5px;
+        background-color: #ffffff;
+      }
+
+      .queue-action > button {
+        display: inline-block;
+        width: 50px;
+        height: 50px;
+      }
+
+      .queue-action > input {
+        margin: 0 10px;
+      }
+
+      .queued .post-action-queue {
+        display: none;
+      }
+
+      .post-status-ok {
+        display: none;
+        border: solid 1px #006600;
+        width: 48px;
+        height: 48px;
+        line-height: 46px;
+        text-align: center;
+        background-color: #00ff00;
+      }
+
+      .queued .post-status-ok {
+        display: inline-block;
+      }
+
+      #postSetSelectorContainer {
+        position: fixed;
+        top: 70px;
+        left: 640px;
+      }
+
+      .post-set-selector ul {
+        padding: 0;
+        list-style-type: none;
+      }
+
+      .post-set-selector li {
+        float: left;
+        margin: 5px;
+      }
+
+      .post-set-selector input {
+        margin-right: 5px;
+        vertical-align: bottom;
+      }
+    </style>
+  </head>
+  <body>
+    <ul id="posts"></ul>
+    <input type="checkbox" id="focusSink" />
+    <div class="queue-action ignore-key-events">
+      <input type="text" id="txtTags" class="post-action-tags" size="80"></input>
+      <button type="button" id="btnQueue" class="post-action-queue">Queue</button>
+      <div class="post-status-ok">OK!</div>
+    </div>
+    <div id="postSetSelectorContainer"></div>
+    <script>
+      'use strict';
+      (function ($, RH) {
+        RH.Logger.setLogLevels({
+        });
+        var logger = new RH.Logger('posts.html');
+        var postDb = new RH.data.IndexedDbAccessor('posts');
+
+        var focusSink = $('#focusSink');
+        var txtTags = $('#txtTags');
+        var btnQueue = $('#btnQueue');
+        var currentQueue = new RH.util.Set();
+
+        var Aliases = {};
+        var Tags = {};
+        var TagClasses = {};
+        [ 'None',
+          'AB', 'ABC', 'ABCD',
+          'Cute', 'Cute3',
+          'AxB', 'AxBxC', 'AxBxCxD',
+          'Fandom'
+        ].forEach( function (name, index) {
+          TagClasses[name] = new RH.tag.TagClass(name, index);
+        });
+
+        function forKeys(map, fn) {
+          for (var key in map) {
+            if (map.hasOwnProperty(key)) {
+              fn(key, map[key]);
+            }
+          }
+        }
+
+        function newTags(input, tagClass, implies) {
+          var results = [];
+          for (var i = 0; i < input.length; i++) {
+            var tag = new RH.tag.Tag(input[i], tagClass);
+            tag.implies.apply(tag, implies);
+            results.push(tag);
+          }
+          return results;
+        }
+
+        var tags = [ new RH.tag.Tag('homestuck', TagClasses.Fandom) ];
+        Array.prototype.push.apply(tags,
+          newTags([ 'aradia megido', 'aranea serket', 'damara megido', 'feferi peixes',
+            'jade harley', 'jane crocker', 'kanaya maryam', 'latula pyrope', 'meenah peixes',
+            'meulin leijon', 'nepeta leijon', 'porrim maryam', 'rose lalonde', 'roxy lalonde',
+            'terezi pyrope', 'vriska serket' ],
+            TagClasses.None, [ 'homestuck' ])
+        );
+
+        var TC = TagClasses.AxB;
+        tags.push(
+          // Pairings
+          new RH.tag.Tag('aradia x feferi', TC).synonyms(TagClasses.AB, 'arafef')
+            .implies('aradia megido', 'feferi peixes'),
+          new RH.tag.Tag('aranea x meenah', TC)
+            .synonyms(TagClasses.Cute, 'les8ifins', 'gillfronds')
+            .implies('aranea serket', 'meenah peixes'),
+          new RH.tag.Tag('aradia x nepeta', TC)
+            .synonyms(TagClasses.AB, 'aranep')
+            .implies('aradia megido', 'nepeta leijon'),
+          new RH.tag.Tag('aradia x rose', TC).matchOn('ararose')
+            .synonyms(TagClasses.AB, 'roseradia')
+            .implies('aradia megido', 'rose lalonde'),
+          new RH.tag.Tag('feferi x jade', TC).matchOn('fefjade')
+            .synonyms(TagClasses.AB, 'jadefef')
+            .implies('feferi peixes', 'jade harley'),
+          new RH.tag.Tag('feferi x nepeta', TC).matchOn('nepfef')
+            .synonyms(TagClasses.AB, 'fefnep')
+            .implies('feferi peixes', 'nepeta leijon'),
+          new RH.tag.Tag('jade x kanaya', TC).matchOn('kanjade')
+            .synonyms(TagClasses.AB, 'jadekan')
+            .implies('jade harley', 'kanaya maryam'),
+          new RH.tag.Tag('jade x nepeta', TC).matchOn('nepjade')
+            .synonyms(TagClasses.AB, 'jadenep')
+            .implies('jade harley', 'nepeta leijon'),
+          new RH.tag.Tag('jade x rose', TC).matchOn('rosejade')
+            .synonyms(TagClasses.AB, 'jaderose')
+            .implies('jade harley', 'rose lalonde'),
+          new RH.tag.Tag('jade x terezi', TC)
+            .synonyms(TagClasses.AB, 'jaderezi')
+            .implies('jade harley', 'terezi pyrope'),
+          new RH.tag.Tag('jade x vriska', TC).matchOn('vrisjade')
+            .synonyms(TagClasses.AB, 'jadevris')
+            .implies('jade harley', 'vriska serket'),
+          new RH.tag.Tag('jane x rose', TC).matchOn('rosejane')
+            .synonyms(TagClasses.AB, 'janerose')
+            .implies('jane crocker', 'rose lalonde'),
+          new RH.tag.Tag('jane x roxy', TC).matchOn('roxyjane')
+            .synonyms(TagClasses.Cute, false, 'cotton candy')
+            .synonyms(TagClasses.AB, 'janeroxy')
+            .implies('jane crocker', 'roxy lalonde'),
+          new RH.tag.Tag('kanaya x feferi', TC).matchOn('kanfef')
+            .synonyms(TagClasses.AB, 'fefkan')
+            .implies('feferi peixes', 'kanaya maryam'),
+          new RH.tag.Tag('kanaya x porrim', TC).matchOn('maryamcest')
+            .synonyms(TagClasses.Cute, 'maryamcest')
+            .synonyms(TagClasses.AB, 'porkan')
+            .implies('kanaya maryam', 'porrim maryam'),
+          new RH.tag.Tag('kanaya x rose', TC).matchOn('rosekan')
+            .synonyms(TagClasses.Cute, 'rosemary')
+            .synonyms(TagClasses.AB, 'kanrose')
+            .implies('kanaya maryam', 'rose lalonde'),
+          new RH.tag.Tag('kanaya x terezi', TC)
+            .synonyms(TagClasses.AB, 'kanrezi')
+            .implies('kanaya maryam', 'terezi pyrope'),
+          new RH.tag.Tag('kanaya x vriska', TC).matchOn('kanvris')
+            .synonyms(TagClasses.AB, 'vriskan')
+            .implies('kanaya maryam', 'vriska serket'),
+          new RH.tag.Tag('meenah x vriska', TC)
+            .synonyms(TagClasses.Cute, 'les8ifins 2.0')
+            .implies('meenah peixes', 'vriska serket'),
+          new RH.tag.Tag('porrim x latula', TC)
+            .synonyms(TagClasses.AB, 'portula')
+            .implies('latula pyrope', 'porrim maryam'),
+          new RH.tag.Tag('rose x terezi', TC)
+            .synonyms(TagClasses.AB, 'roserezi')
+            .implies('rose lalonde', 'terezi pyrope'),
+          new RH.tag.Tag('rose x roxy', TC).matchOn('lalondecest', 'roseroxy')
+            .synonyms(TagClasses.Cute, 'lalondecest')
+            .synonyms(TagClasses.AB, 'roseroxy')
+            .implies('rose lalonde', 'roxy lalonde'),
+          new RH.tag.Tag('rose x vriska', TC).matchOn('grimluck', 'rosevris')
+            .synonyms(TagClasses.Cute, 'grimluck')
+            .synonyms(TagClasses.AB, 'rosevris')
+            .implies('rose lalonde', 'vriska serket'),
+          new RH.tag.Tag('terezi x vriska', TC).matchOn('scourgecest')
+            .synonyms(TagClasses.Cute, 'blind luck', 'scourge sisters')
+            .synonyms(TagClasses.AB, 'vrisrezi')
+            .implies('terezi pyrope', 'vriska serket'),
+
+          // OT3s
+          new RH.tag.Tag('aradia x feferi x nepeta', TagClasses.AxBxC)
+            .synonyms(TagClasses.ABC, 'arafefnep')
+            .implies('aradia megido', 'feferi peixes', 'nepeta leijon'),
+          new RH.tag.Tag('jade x kanaya x rose', TagClasses.AxBxC)
+            .synonyms(TagClasses.ABC, 'jaderosekan')
+            .implies('jade harley', 'kanaya maryam', 'rose lalonde'),
+          new RH.tag.Tag('kanaya x rose x terezi', TagClasses.AxBxC)
+            .synonyms(TagClasses.ABC, 'kanroserezi')
+            .implies('kanaya maryam', 'rose lalonde', 'terezi pyrope'),
+          new RH.tag.Tag('kanaya x rose x vriska', TagClasses.AxBxC)
+            .matchOn('kanrosevris', 'vriskanrose')
+            .synonyms(TagClasses.Cute3, 'photophilia')
+            .synonyms(TagClasses.ABC, 'vrisrosekan')
+            .implies('kanaya maryam', 'rose lalonde', 'vriska serket'),
+          new RH.tag.Tag('kanaya x terezi x vriska', TagClasses.AxBxC)
+            .synonyms(TagClasses.ABC, 'vriskanrezi')
+            .implies('kanaya maryam', 'terezi pyrope', 'vriska serket'),
+
+          // OT4s
+          new RH.tag.Tag('kanaya x rose x terezi x vriska', TagClasses.AxBxCxD)
+            .matchOn('lesbian meteor shitfest')
+            .synonyms(TagClasses.ABCD, 'vriskanroserezi')
+            .implies('kanaya maryam', 'terezi pyrope', 'vriska serket')
+        );
+
+        var autoTagger = new RH.tag.AutoTagger(tags);
+
+        var tagSet = new RH.tag.TagSet(tags.filter(function (tag) {
+          var w = window.parent || window;
+          if (w.location.hash.length > 1) {
+            var re = new RegExp('(^#|;)' + tag.name + '(;|$)');
+            if (re.test(w.location.hash)) {
+              logger.debug('Found tag in hash: ', tag.name);
+              return true;
+            }
+            return false;
+          } else {
+            var tc = tag.tagClass;
+            return (tc == TagClasses.AxB || tc == TagClasses.AxBxC || tc == TagClasses.AxBxCxD);
+          }
+        }));
+
+        var tumblrLambda = new RH.aws.Lambda('Tumblr');
+        var sessionId;
+        var activeTumblrUser = null;
+        var activeTumblrBlog = null;
+        var postSet;
+        var postSetSelector;
+        var isLoadingPost;
+        var currentPost;
+
+        console.log('Setting up initialize');
+        window.initialize = function (params) {
+          AWS.config.region = 'us-east-1';
+          AWS.config.credentials = params.credentials;
+          sessionId = params.sessionId;
+          activeTumblrUser = params.activeTumblrUser;
+          activeTumblrBlog = params.activeTumblrBlog;
+
+          if (!postSet) {
+            postSet = tagSet.getPosts(sessionId, activeTumblrUser);
+            postSetSelector = new RH.ui.PostSetSelector(postSet);
+            postSetSelector.renderTo($('#postSetSelectorContainer'));
+
+            getNextPost();
+            getQueuedPosts();
+          }
+        };
+
+        function getQueuedPosts(postOffset) {
+          if (isNaN(postOffset)) {
+            postOffset = 0;
+          }
+
+          logger.info('Retrieving queued posts starting at post', postOffset);
+          tumblrLambda.invoke({
+            action: 'get_queued_posts',
+            sessionId: sessionId,
+            userName: activeTumblrUser.name,
+            blogName: activeTumblrBlog,
+            options: {
+              offset: postOffset,
+              limit: 20
+            }
+          }, function (err, result) {
+            if (err) {
+              logger.error('An error occurred while fetching queued posts:', err);
+              alert('An error occurred while fetching queued posts.');
+            } else {
+              logger.debug('Retrieved ' + result.posts.length + ' queued posts.');
+              for (var i = 0; i < result.posts.length; i++) {
+                var post = result.posts[i];
+                for (var j = 0; j < post.trail.length; j++) {
+                  currentQueue.add(post.trail[j].post.id);
+                }
+              }
+              if (result.posts.length == 20) {
+                getQueuedPosts(postOffset + 20);
+              }
+            }
+          });
+        }
+
+        function getNextPost() {
+          if (isLoadingPost) {
+            return;
+          } else if (currentPost && !currentPost.isRemembered) {
+            currentPost.remembered = true;
+            postDb.add(currentPost, function (err, res) {
+              if (err) {
+                logger.error('Error adding post to database', err);
+              } else {
+                logger.debug('Remembering post', currentPost, res);
+              }
+            });
+          }
+
+          $(document.body).addClass('loading-post');
+          postSet.getNextPost(function (err, post) {
+            $(document.body).removeClass('loading-post');
+            if (err) {
+              console.log('Failed to get next post:', err);
+              return;
+            }
+
+            if (!renderPost(post)) {
+              getNextPost();
+            }
+          });
+        }
+
+        function getPreviousPost() {
+          if (isLoadingPost) {
+            return;
+          } else if (document.body.scrollTop != 0) {
+            // Start by scrolling up to top of current post.
+            document.body.scrollTop = 0;
+            return;
+          }
+
+          var post = postSet.getPreviousPost();
+          if (post) {
+            if (!renderPost(post)) {
+              getPreviousPost();
+            }
+          }
+        }
+
+        function reblogPost(postNode) {
+          $(document.body).addClass('in-progress');
+          var basePostId = postNode.data('basePostId');
+          var post = postNode.data('post');
+          tumblrLambda.invoke({
+            action: 'call_api',
+            sessionId: sessionId,
+            userName: activeTumblrUser.name,
+            api: 'posts',
+            args: [ activeTumblrBlog, { tag: basePostId, limit: 1 } ]
+          }, function (err, res) {
+            if (err) {
+              alert('An error occurred while checking to see if post was already reblogged.');
+              $(document.body).removeClass('in-progress');
+            } else if (res.posts.length > 0) {
+              alert('Post already reblogged.');
+              logger.info('Post already reblogged:', res.posts[0].post_url);
+              post.queued = true;
+              $(document.body).removeClass('in-progress').addClass('queued');
+            } else {
+              logger.debug('Post not reblogged yet, so will reblog now.');
+              var options = $.extend({}, postNode.data('reblogOptions'), {
+                blogName: activeTumblrBlog + '.tumblr.com',
+                tags: txtTags.val() + ', ' + basePostId
+              });
+
+              tumblrLambda.invoke({
+                action: 'reblog_post',
+                sessionId: sessionId,
+                userName: activeTumblrUser.name,
+                parameters: options
+              }, function (err, response) {
+                if (err) {
+                  alert('An error occurred while reblogging the post.');
+                  $(document.body).removeClass('in-progress');
+                } else {
+                  console.log('Reblogged post: ', response);
+                  post.queued = true;
+                  currentQueue.add(post.id);
+                  $(document.body).removeClass('in-progress').addClass('queued');
+                  getNextPost();
+                }
+              });
+            }
+          });
+        }
+
+        function renderPost(post) {
+          var enabledTags = postSetSelector.getEnabledTags();
+          if (!enabledTags.has(post.tagSetTag.name)) {
+            logger.info('Skipping post tagged', JSON.stringify(post.tags));
+            return false;
+          }
+
+          post.queued = currentQueue.includes(post.id);
+
+          var postItem = $('<li class="post"></li>')
+            .attr('data-post-id', post.id)
+            .data('post', post)
+            .data('reblogOptions', {
+              type: post.type,
+              state: 'queue',
+              postId: post.id,
+              reblogKey: post.reblog_key
+            })
+            .data('basePostId', post.trail[0].post.id);
+
+          if (post.title && post.type != 'link') {
+            postItem.append($('<h3></h3>').text(post.title));
+          }
+
+          var postContent = $('<div class="post-content"></div>')
+            .addClass('post-content-' + post.type);
+          if (post.type == 'text') {
+            postContent.html(post.body);
+          } else if (post.type == 'photo') {
+            post.photos.forEach(function (photo) {
+              var bestSize = photo.alt_sizes[0];
+              photo.alt_sizes.forEach(function (size) {
+                if ((size.width >= 540 && size.width < bestSize.width) ||
+                    (size.width < 540 && size.width > bestSize.width)) {
+                  bestSize = size;
+                }
+              });
+              postContent.append($('<img />')
+                .attr('src', bestSize.url)
+                .attr('width', 540)
+                .attr('height', Math.floor((540.0 / bestSize.width) * bestSize.height))
+                .attr('title', photo.caption)
+              );
+            });
+          } else if (post.type == 'quote') {
+            postContent
+              .append($('<div class="quote-text"></div>').text(post.text))
+              .append($('<div class="quote-source"></div>').html(post.source));
+          } else if (post.type == 'link') {
+            postContent.append($('<a />').text(post.title).attr('href', post.url));
+          } else if (post.type == 'chat') {
+            postContent.append($('<div class="chat-body"></div>').text(post.body));
+          } else if (post.type == 'audio') {
+            postContent.append($('<div class="media"></div>').html(post.player));
+          } else if (post.type == 'video') {
+            postContent.append($('<div class="media"></div>').html(post.player[0]));
+          } else if (post.type == 'answer') {
+            postContent
+              .append($('<div class="asker"></div>')
+                .append(generateBlogLink(post.asking_name, post.asking_url))
+              )
+              .append($('<div class="question"></div>').text(post.question))
+              .append($('<div class="answer"></div>').html(post.answer));
+          }
+
+          if (post.caption) {
+            postContent.append($('<div class="post-caption"></div>').html(post.caption));
+          }
+
+          var tags = post.tags.join(' #');
+          if (tags.length) {
+            tags = '#' + tags;
+          }
+
+          postItem
+            .append(postContent)
+            .append($('<div class="post-footer"></div>')
+              .append($('<div class="post-blog"></div>')
+                .append(generateBlogLink(post.blog_name, post.post_url))
+                .append(generateFriendlyTime(post.timestamp))
+              )
+              .append($('<div class="post-tags"></div>').text(tags))
+            );
+          $('#posts').empty().append(postItem).get(0);
+          document.body.scrollTop = 0;
+          $(document.body).toggleClass('queued', !!post.queued);
+          txtTags.val(autoTagger.computeTags(post.tags).join(', '));
+          focusSink.focus();
+          currentPost = post;
+          return true;
+        }
+
+        function generateBlogLink(name, url) {
+          return $('<a class="blog-link" target="_blank"></a>').text(name).attr('href', url);
+        }
+
+        function generateFriendlyTime(timestamp) {
+          var divisors = [60, 60, 24, 30, 12];
+          var names = ['second', 'minute', 'hour', 'day', 'month', 'year'];
+          var duration = (Date.now() / 1000) - timestamp;
+          var i = 0;
+          for (; i < divisors.length; i++) {
+            if (duration < divisors[i]) {
+              break;
+            }
+            duration /= divisors[i];
+          }
+          duration = Math.round(duration);
+          var name = names[Math.min(names.length, i)] + (duration == 1 ? '' : 's');
+          return document.createTextNode(' about ' + duration.toString() + ' ' + name + ' ago');
+        }
+
+        var postNavigator = (function () {
+          var orderedPosts = [];
+          var tagSetPosts = [];
+          var postIndex = null;
+
+          function loadPosts(res) {
+            console.log('Result: ', res);
+            console.log('Found ' + res.posts.length + ' posts from ' + res.tag.tag.name);
+            if (res.posts.length == 0) {
+              console.log('Ignoring empty results from ' + res.tag);
+              return;
+            }
+
+            tagSetPosts.unshift(res);
+            console.log('Now have ' + tagSetPosts.length + ' tag set results.');
+            if (postIndex == null) {
+              gotoNextPost();
+            }
+          }
+
+          function gotoNextPost() {
+            if (postIndex == null) {
+              postIndex = 0;
+            } else {
+              postIndex += 1;
+            }
+            console.log('Going to post ' + postIndex);
+
+            if (postIndex >= orderedPosts.length) {
+              console.log('Need to find next post.');
+              if (tagSetPosts.length == 0) {
+                console.log('No more posts to show.');
+                return;
+              }
+
+              var curPosts = tagSetPosts.shift();
+              console.log('Pulling post from ' + curPosts.tag);
+              orderedPosts.push(curPosts.posts.shift());
+              if (curPosts.posts.length > 0) {
+                tagSetPosts.push(curPosts);
+              } else {
+                console.log('No more posts from ' + curPosts.tag);
+              }
+            }
+
+            renderPost(orderedPosts[postIndex]);
+          }
+
+
+          return {
+            loadPosts: loadPosts,
+            gotoNextPost: gotoNextPost
+          };
+        })();
+
+        function scrollDown() {
+          document.body.scrollTop += window.innerHeight / 2;
+        }
+
+        function scrollUp() {
+          document.body.scrollTop -= window.innerHeight / 2;
+        }
+
+        $('body').on('keydown', function (ev) {
+          if (ev.keyCode == 27) { // <escape>
+            focusSink.focus();
+          }
+        });
+
+        $('body').on('keypress', function (ev) {
+          if ($(document.body).hasClass('in-progress')) {
+            // If already processing a queue action, ignore key presses.
+            return;
+          }
+
+          if ($(ev.target).closest('.ignore-key-events').length > 0) {
+            // Don't react to key presses in the queue post form.
+            return;
+          }
+
+          var passThrough = false;
+          if (ev.keyCode == 106) { // j
+            getNextPost();
+          } else if (ev.keyCode == 107) { // k
+            getPreviousPost();
+          } else if (ev.keyCode == 101) { // e
+            txtTags.focus();
+          } else if (ev.keyCode == 100) { // d
+            scrollDown();
+          } else if (ev.keyCode == 119) { // w
+            scrollUp();
+          } else {
+            passThrough = true;
+          }
+
+          if (!passThrough) {
+            ev.preventDefault();
+          }
+        });
+
+        $('.post-action-queue').on('click', function (ev) {
+          if ($(document.body).hasClass('in-progress')) {
+            return;
+          }
+
+          reblogPost($('.post'));
+        });
+      })(jQuery, window.ReblogHelper);
+    </script>
+  </body>
+</html>
